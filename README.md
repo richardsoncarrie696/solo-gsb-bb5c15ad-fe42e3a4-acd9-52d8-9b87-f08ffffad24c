@@ -8,6 +8,12 @@ YAML 场景，服务按**会话令牌**隔离每个调用方的当前状态，�
 旧版本定义保留不覆盖；会话在创建时绑定当时的当前 revision，之后无论场景再发布多少新版本，
 该会话的真实请求与预演都始终按绑定版本执行。
 
+会话可携带**随机种子（seed）**：创建或重置会话时传入后，模板中的
+`uuid4()` / `random_str()` / `randint()` / `choice()` 按会话级确定性序列取值——
+同一 seed、同一初始状态与同一请求链必然产生相同结果；随机状态随会话上下文在
+同一个 SQLite 写事务中推进，会话查询中可看到累计抽样步数。未传 seed 时保持
+原有的进程级随机行为与接口兼容。
+
 - 技术栈：Python 3.12 · FastAPI · SQLite（WAL）· Jinja2 沙箱模板 · PyYAML
 - 容器内启动即自动完成依赖安装与数据库初始化（含旧库就地升级），并自动加载 `scenarios/` 下的示例场景
 
@@ -142,6 +148,8 @@ routes:
   `request`（`method`/`path`/`route`）。
 - 内置函数：`uuid4()`、`now(fmt)`、`random_str(n, prefix='')`、`randint(a,b)`、
   `choice(list)`、`seq(name, start=1)`（会话内自增计数器，跨请求持久化）。
+  会话传入 `seed` 后，`uuid4()`/`random_str()`/`randint()`/`choice()` 按会话级
+  确定性序列取值（见下文「可复现随机序列（seed）」）。
 - 过滤器：Jinja2 标准过滤器（如 `body.x | default('v')`）。
 - 响应体 `body` 为 dict/list 时按 JSON 返回；为字符串时配合 `Content-Type` 头
   可返回 HTML/纯文本等。
@@ -215,13 +223,57 @@ curl -s "$BASE/__scenarios/order-flow/yaml?revision=1"
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/__sessions` | 显式创建会话：`{"token":"t1","scenario":"order-flow","state":"created","context":{}}`，字段均可省略；绑定**当前 revision** 并在响应中返回 |
-| GET | `/__sessions/{token}` | **会话状态查询**：当前状态、绑定的 `revision`、上下文、可用状态、路由列表（按绑定版本给出） |
+| POST | `/__sessions` | 显式创建会话：`{"token":"t1","scenario":"order-flow","state":"created","context":{}}`，字段均可省略；可传 `"seed"` 启用可复现随机序列；绑定**当前 revision** 并在响应中返回 |
+| GET | `/__sessions/{token}` | **会话状态查询**：当前状态、绑定的 `revision`、上下文、随机序列摘要 `random`（`seed` 与累计抽样步数 `draws`，未启用为 `null`）、可用状态、路由列表（按绑定版本给出） |
 | GET | `/__sessions/{token}/events?limit=50` | 最近的匹配与状态迁移历史（新→旧，含每次命中时的 `revision`） |
 | POST | `/__sessions/{token}/preview` | **请求预演**：不落库地试运行一次业务请求，返回拟响应与 state/context 差异（按会话绑定的 revision 执行） |
 | POST | `/__sessions/{token}/preview/chain` | **连续请求链预演**：有序请求数组基于同一会话快照依次试跑（最多 50 步），逐步返回命中/拟响应/差异与最终快照，不落库 |
-| POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态并清空事件；不改变会话绑定的 revision |
+| POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态并清空事件；不改变会话绑定的 revision；可传 `"seed"` 让随机序列从头初始化 |
 | DELETE | `/__sessions/{token}` | 删除会话及其事件 |
+
+#### 可复现随机序列（seed）
+
+创建会话或重置会话时传入 `seed`（字符串/数字/布尔），该会话即获得一条
+**确定性随机序列**：模板中的 `uuid4()`、`random_str()`、`randint()`、
+`choice()` 不再使用进程级随机源，而是从会话自带的随机状态依次取值。
+**同一 seed、同一初始状态与同一请求链，必然产生完全相同的随机结果**——
+联调用例与排障回放因此可以逐字节复现。
+
+- 随机状态（seed + 序列位置）作为会话上下文的一部分持久化，并在**同一个
+  SQLite 写事务**中随状态迁移一起推进；请求处理失败（无路由、无命中规则、
+  渲染错误等）时随机序列**不会被消耗**，修正后重试仍得到同一个值；
+- 每调用一次上述任一函数计 **1 步抽样**；`GET /__sessions/{token}` 响应的
+  `random` 字段暴露 seed 与累计抽样步数 `draws`（未传 seed 的会话为 `null`）；
+- 单次预演与请求链预演都**克隆**当前随机状态：链内后一步能看到前一步的
+  消耗（每步结果附 `rng` 字段，链预演 `final_snapshot.random` 给出拟最终
+  步数），但预演结束后真实序列保持不变；
+- `reset` 时再次传入 `seed` 可让随机序列**从头初始化**；不传则重置后的
+  会话回到进程级随机行为；
+- 未传 `seed` 的会话（含懒创建会话）保持原有行为：四个函数使用进程级
+  随机源，结果不可复现，接口字段完全兼容。
+
+```bash
+# 两个会话使用同一 seed + 同一初始状态
+curl -s -X POST $BASE/__sessions -H 'Content-Type: application/json' \
+  -d '{"token":"s1","state":"created","seed":"demo-1"}'
+curl -s -X POST $BASE/__sessions -H 'Content-Type: application/json' \
+  -d '{"token":"s2","state":"created","seed":"demo-1"}'
+
+# 发出相同请求，响应中的 uuid4() 完全一致
+curl -s -X POST $BASE/orders/7/pay -H 'sim-session-token: s1' \
+  -H 'Content-Type: application/json' -d '{"channel":"alipay"}'
+curl -s -X POST $BASE/orders/7/pay -H 'sim-session-token: s2' \
+  -H 'Content-Type: application/json' -d '{"channel":"alipay"}'
+# -> 两个响应体的 trace 字段相同
+
+# 会话查询暴露累计抽样步数
+curl -s $BASE/__sessions/s1
+# -> {"token":"s1", ..., "random":{"seed":"demo-1","draws":1}}
+
+# 重置并重新播种：随机序列从头开始
+curl -s -X POST $BASE/__sessions/s1/reset -H 'Content-Type: application/json' \
+  -d '{"state":"created","seed":"demo-1"}'
+```
 
 #### 请求预演（dry-run）
 
@@ -231,6 +283,8 @@ curl -s "$BASE/__scenarios/order-flow/yaml?revision=1"
 - 全程在只读事务中执行并最终回滚：**不写 sessions、不写 events**；
 - 即使模板调用了 `seq()`，计数也只在预演渲染器内存中自增——随后的真实请求
   仍从**预演前的计数值**开始（可多次预演，结果幂等）；
+- seed 会话的随机序列同样只在克隆的状态上消耗：预演结果的 `rng` 字段给出
+  本步抽样前后步数，真实序列保持不变；
 - 命中时 HTTP 状态码为 `200`，拟返回的状态码在 `response.status_code` 中；
   未命中时直接返回**与真实请求一致的状态码与错误详情**（404 / 405 / 409 /
   500 等），并附带逐条件判定轨迹 `trace`；
@@ -279,6 +333,7 @@ curl -s -X POST $BASE/__sessions/t1/preview \
      "before": null,
      "note": "仅预演内自增，不会持久化；随后真实请求仍从预演前的计数开始"}
   ],
+  "rng": null,
   "trace": [
     {"stage": "route", "route": "pay-order", "path": "/orders/{order_id}/pay",
      "path_match": true, "method_match": true, "path_params": {"order_id": "42"}},
@@ -306,24 +361,25 @@ curl -s -X POST $BASE/__sessions/t1/preview \
 
 在**不改动会话**的前提下，把一组**有序请求**当作一条真实调用链依次试跑：
 从该会话的当前快照出发，**后一步一定能看到前一步拟产生的 `state`、
-`context` 与 `seq` 计数变化**，用于一次性确认"我按顺序发这一串请求会发生
-什么"（如下单 → 支付 → 发货 → 收货）。
+`context`、`seq` 计数与随机序列消耗**，用于一次性确认"我按顺序发这一串
+请求会发生什么"（如下单 → 支付 → 发货 → 收货）。
 
 - 请求体只有一个字段 `requests`：元素结构与单次预演**完全相同**（`path`
   必填，`method` 默认 `GET`，`query`/`headers`/`body` 语义一致），**最多
   50 步**，超出返回 422；
 - 每一步复用与单次预演/真实请求**同一份**路由匹配、规则判定与 Jinja 渲染
   逻辑；每步返回内容与单次预演一致：`matched` / `request` / `response` /
-  `state_diff` / `context_diff` / `seq_preview` / `trace`；
+  `state_diff` / `context_diff` / `seq_preview` / `rng` / `trace`；
 - 拟响应为错误状态码但**确实命中了规则**（如 400/409 兜底规则）属于正常
   模拟响应，链路继续；只有**路由失败**（404/405）、**无规则命中**（409
   `no_matching_rule`）或**渲染失败**（500 `render_error`）才会立即停止，
   返回 `failed_index`、失败类型 `failure.kind`（`route`/`rule`/`render`）、
   失败请求与错误体（含 `trace`），以及此前已成功的各步；
 - 全程在只读事务中执行并最终回滚：**不写 sessions、不写 events、不推进序列
-  计数**；`seq()` 只在预演内存中沿链路自增（后一步看得到、库中不保留），
-  会话快照不变时**多次调用结果可重复**（模板内的 `now()`/`uuid4()` 与单次
-  预演一样是运行时值）；
+  计数与随机序列**；`seq()` 只在预演内存中沿链路自增，seed 会话的随机序列
+  也只在克隆的状态上消耗（后一步看得到、库中不保留），会话快照不变时
+  **多次调用结果可重复**（模板内的 `now()` 是运行时值；未 seed 会话的
+  `uuid4()` 等同样是运行时随机值）；
 - 同样要求会话**已存在**，不存在返回 404。
 
 ```bash
@@ -379,6 +435,7 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
     "context": {"sku": "A-1", "quantity": 2, "pay_channel": "alipay",
                 "carrier": "sf"},
     "seq": {"order": 1001},
+    "random": null,
     "note": "链路预演的拟最终快照，不会持久化；随后真实请求仍从预演前的快照开始"
   }
 }
@@ -473,7 +530,7 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 │   ├── scenario.py        # YAML 解析与校验
 │   ├── models.py          # 场景/路由/规则数据模型
 │   ├── matching.py        # 路径模式、点路径取值、条件运算符
-│   ├── renderer.py        # Jinja2 沙箱渲染与模板函数
+│   ├── renderer.py        # Jinja2 沙箱渲染、模板函数与会话级确定性随机源（seed）
 │   ├── engine.py          # 核心：单事务匹配→渲染→迁移；同快照只读单请求/请求链预演（零副作用）
 │   ├── store.py           # 已编译场景缓存（按 name+revision）、发布/激活
 │   └── routers/
@@ -489,9 +546,11 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 
 数据库表：`scenarios`（场景名 → 当前 revision）、`scenario_revisions`（不可变的
 场景定义版本，`(scenario, revision)` 主键）、`sessions`（令牌 → 场景/绑定
-revision/状态/上下文）、`events`（每次命中的 revision、路由、规则、前后状态与
-状态码）。启动时自动检测并就地升级旧版表结构：旧定义固化为 revision 1，
-既有会话回填绑定该版本，历史事件的 revision 置空。
+revision/状态/上下文；上下文内含 `_seq` 计数器与 `_rng` 随机序列状态）、
+`events`（每次命中的 revision、路由、规则、前后状态与状态码）。启动时自动检测
+并就地升级旧版表结构：旧定义固化为 revision 1，既有会话回填绑定该版本，
+历史事件的 revision 置空。随机序列状态存于上下文 JSON 内部，无需表结构变更，
+既有会话不受影响。
 
 ---
 

@@ -3,9 +3,10 @@
 同一会话快照还支持**预演**（``preview_session`` / ``preview_chain``）：在只读
 事务中复用路由匹配、条件判定与模板渲染的同一份代码。单次预演产出拟响应与
 state/context 差异；请求链预演（``preview_chain``）从同一快照出发依次执行
-有序请求，后一步看到前一步拟产生的 state/context/seq 变化，任一匹配或渲染
-失败即停止。两种预演全程回滚、不写任何表；即使模板调用 ``seq()``，计数器
-也只在一次性的渲染器实例内自增，随后的真实请求仍看到预演前的值。
+有序请求，后一步看到前一步拟产生的 state/context/seq/随机序列变化，任一匹配
+或渲染失败即停止。两种预演全程回滚、不写任何表；即使模板调用 ``seq()`` 或
+会话级随机函数，计数与随机状态也只在一次性的渲染器实例内推进，随后的真实
+请求仍看到预演前的值。
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from urllib.parse import parse_qsl
 from .db import dumps, read_tx, write_tx
 from .matching import evaluate_condition, get_condition_value, match_path
 from .models import Route, Rule, Scenario
-from .renderer import RenderError, Renderer
+from .renderer import RenderError, Renderer, SessionRNG
 from .store import store
 
 
@@ -234,6 +235,8 @@ class _Planned:
     new_context: dict[str, Any]
     counters: dict[str, int]
     seq_calls: list[dict[str, Any]]
+    rng: SessionRNG | None
+    rng_draws_before: int | None
     trace: list[dict[str, Any]]
 
 
@@ -253,7 +256,11 @@ def _plan_matched(scenario: Scenario, scenario_name: str, route: Route,
         "context": dict(context),
     })
     # 预演（preview=True）时记录 seq() 调用；计数器在任何情况下都只存于本实例
-    renderer = Renderer(render_ctx, trace_calls=True)
+    # seed 会话从上下文克隆随机状态：渲染消耗的抽样只推进内存副本，
+    # 由调用方决定（真实请求）是否随事务写回上下文
+    rng = SessionRNG.from_context(context)
+    rng_draws_before = rng.draws if rng is not None else None
+    renderer = Renderer(render_ctx, trace_calls=True, rng=rng)
 
     try:
         status, resp_headers, resp_body, is_json = _render_response(rule, renderer)
@@ -277,6 +284,9 @@ def _plan_matched(scenario: Scenario, scenario_name: str, route: Route,
     new_context = dict(context)
     new_context.update(updates)
     new_context["_seq"] = renderer.counters
+    if rng is not None:
+        # 随机状态随上下文一并推进；渲染失败时本函数已抛出，不会到达这里
+        new_context[SessionRNG.STATE_KEY] = rng.snapshot()
 
     return _Planned(
         scenario_name=scenario_name,
@@ -294,6 +304,8 @@ def _plan_matched(scenario: Scenario, scenario_name: str, route: Route,
         new_context=new_context,
         counters=dict(renderer.counters),
         seq_calls=list(renderer.seq_calls),
+        rng=rng,
+        rng_draws_before=rng_draws_before,
         trace=trace,
     )
 
@@ -430,13 +442,13 @@ MAX_PREVIEW_STEPS = 50
 
 
 def _build_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-    """以 after 相对 before 的视角生成 added/changed/removed 差异（跳过 _seq）。"""
+    """以 after 相对 before 的视角生成 added/changed/removed 差异（跳过 _seq/_rng）。"""
     added: dict[str, Any] = {}
     changed: dict[str, Any] = {}
     removed: list[str] = []
     keys = set(before) | set(after)
     for key in keys:
-        if key == "_seq":
+        if key in ("_seq", SessionRNG.STATE_KEY):
             continue
         if key not in before:
             added[key] = after[key]
@@ -463,6 +475,18 @@ def _build_seq_preview(context: dict[str, Any], counters: dict[str, int],
         }
         for call in seq_calls
     ]
+
+
+def _build_rng_preview(planned: _Planned) -> dict[str, Any] | None:
+    """单次渲染的随机序列消耗说明；未启用 seed 的会话返回 None。"""
+    if planned.rng is None:
+        return None
+    return {
+        "seed": planned.rng.seed,
+        "draws_before": planned.rng_draws_before,
+        "draws_after": planned.rng.draws,
+        "note": "仅预演内消耗，不会持久化；随后真实请求仍从预演前的随机状态继续",
+    }
 
 
 def _simulate_step(scenario: Scenario, scenario_name: str, revision: int, *, state: str,
@@ -522,6 +546,7 @@ def _simulate_step(scenario: Scenario, scenario_name: str, revision: int, *, sta
         "context_diff": _build_diff(planned.context, planned.new_context),
         "seq_preview": _build_seq_preview(planned.context, planned.counters,
                                           planned.seq_calls),
+        "rng": _build_rng_preview(planned),
         "trace": planned.trace,
     }
     return step, planned.next_state, planned.new_context
@@ -583,7 +608,7 @@ def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict
     """连续预演一条有序请求链，返回 (HTTP 状态码, 结构化结果)。
 
     从会话当前快照出发在纯内存中逐步行进：每一步都能看到此前各步拟产生的
-    state、context 与 seq 计数变化。任一路由/规则/渲染失败立即停止。
+    state、context、seq 计数与随机序列消耗。任一路由/规则/渲染失败立即停止。
     全程只读、不落库；不改变会话快照时，重复调用结果可重复。
     """
     with read_tx() as conn:
@@ -648,8 +673,10 @@ def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict
 
         final_snapshot = {
             "state": state,
-            "context": {k: v for k, v in context.items() if k != "_seq"},
+            "context": {k: v for k, v in context.items()
+                        if k not in ("_seq", SessionRNG.STATE_KEY)},
             "seq": seq_counters,
+            "random": SessionRNG.info(context),
             "note": "链路预演的拟最终快照，不会持久化；随后真实请求仍从预演前的快照开始",
         }
 

@@ -12,9 +12,19 @@ from pydantic import BaseModel, Field, field_validator
 
 from ..db import dumps, get_conn, write_tx
 from ..engine import MAX_PREVIEW_STEPS, SimAbort, preview_chain, preview_session
+from ..renderer import SessionRNG
 from ..store import store
 
 router = APIRouter(prefix="/__sessions", tags=["sessions"])
+
+
+def _validate_seed(value: Any) -> Any:
+    """seed 只接受 JSON 标量；None 表示不启用可复现随机序列。"""
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    raise ValueError("seed 必须是字符串、数字或布尔值")
 
 
 class CreateSessionBody(BaseModel):
@@ -22,6 +32,12 @@ class CreateSessionBody(BaseModel):
     scenario: str | None = None
     state: str | None = None
     context: dict = Field(default_factory=dict)
+    seed: Any = Field(default=None,
+                      description="可选随机种子（字符串/数字/布尔）：传入后 "
+                                  "uuid4()/random_str()/randint()/choice() 按会话级"
+                                  "确定性序列取值")
+
+    _check_seed = field_validator("seed")(_validate_seed)
 
 
 def _session_row(token: str):
@@ -36,12 +52,17 @@ def _session_row(token: str):
 
 
 def _serialize(row) -> dict:
+    context = json.loads(row["context"])
+    # 内部随机状态不随上下文原文暴露，以摘要形式给出（含累计抽样步数）
+    random_info = SessionRNG.info(context)
+    context.pop(SessionRNG.STATE_KEY, None)
     return {
         "token": row["token"],
         "scenario": row["scenario"],
         "revision": row["revision"],
         "state": row["state"],
-        "context": json.loads(row["context"]),
+        "context": context,
+        "random": random_info,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -77,6 +98,9 @@ async def create_session(body: CreateSessionBody) -> JSONResponse:
 
     context = dict(body.context)
     context.setdefault("_seq", {})
+    if body.seed is not None:
+        # 传入 seed：随机序列从头初始化，随上下文在同一写事务中落库
+        context[SessionRNG.STATE_KEY] = SessionRNG.fresh(body.seed).snapshot()
 
     with write_tx() as conn:
         try:
@@ -128,6 +152,11 @@ async def list_events(token: str, limit: int = 50) -> JSONResponse:
 class ResetBody(BaseModel):
     state: str | None = None
     context: dict | None = None
+    seed: Any = Field(default=None,
+                      description="可选随机种子：传入后随机序列从头初始化；"
+                                  "不传则重置后不再持有随机序列（除非 context 中显式给出）")
+
+    _check_seed = field_validator("seed")(_validate_seed)
 
 
 _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
@@ -278,6 +307,9 @@ async def reset_session(token: str, body: ResetBody) -> JSONResponse:
                                               "state": state, "states": scenario.states})
     context = body.context if body.context is not None else {}
     context.setdefault("_seq", {})
+    if body.seed is not None:
+        # 传入 seed：随机序列从头初始化（与创建会话时传 seed 等价）
+        context[SessionRNG.STATE_KEY] = SessionRNG.fresh(body.seed).snapshot()
 
     with write_tx() as conn:
         conn.execute(
