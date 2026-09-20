@@ -1,0 +1,198 @@
+name: order-flow
+description: 下单 -> 支付 -> 发货 -> 收货 的有状态订单流，含取消分支
+initial_state: init
+states: [init, created, paid, shipped, completed, cancelled]
+
+routes:
+  - id: create-order
+    path: /orders
+    methods: [POST]
+    rules:
+      - name: create-success
+        priority: 100
+        when:
+          - source: state
+            op: eq
+            value: init
+          - source: body
+            path: sku
+            op: exists
+          - source: body
+            path: quantity
+            op: gte
+            value: 1
+        response:
+          status: 201
+          headers:
+            Content-Type: application/json
+          body:
+            order_id: "{{ seq('order', 1000) }}"
+            sku: "{{ body.sku }}"
+            quantity: "{{ body.quantity }}"
+            status: created
+            created_at: "{{ now('%Y-%m-%dT%H:%M:%SZ') }}"
+        set:
+          sku: "{{ body.sku }}"
+          quantity: "{{ body.quantity }}"
+        next_state: created
+
+      - name: missing-sku
+        priority: 10
+        response:
+          status: 400
+          body:
+            error: invalid_request
+            detail: 缺少 sku 或 quantity 不合法
+
+  - id: pay-order
+    path: /orders/{order_id}/pay
+    methods: [POST]
+    rules:
+      - name: pay-created
+        priority: 100
+        when:
+          - source: state
+            op: eq
+            value: created
+          - source: body
+            path: channel
+            op: in
+            value: [alipay, wechat, card]
+        response:
+          status: 200
+          body:
+            order_id: "{{ path.order_id }}"
+            paid: true
+            channel: "{{ body.channel }}"
+            paid_at: "{{ now('%Y-%m-%dT%H:%M:%SZ') }}"
+            trace: "{{ uuid4() }}"
+        set:
+          pay_channel: "{{ body.channel }}"
+        next_state: paid
+
+      - name: double-pay-rejected
+        priority: 50
+        when:
+          - source: state
+            op: in
+            value: [paid, shipped, completed]
+        response:
+          status: 409
+          body:
+            error: already_paid
+            detail: 当前状态 {{ state }} 不允许重复支付
+
+      - name: bad-channel
+        priority: 10
+        response:
+          status: 400
+          body:
+            error: invalid_channel
+            detail: 仅支持 alipay / wechat / card
+
+  - id: ship-order
+    path: /orders/{order_id}/ship
+    methods: [POST]
+    rules:
+      - name: ship-paid
+        priority: 100
+        when:
+          - source: state
+            op: eq
+            value: paid
+        response:
+          status: 200
+          body:
+            order_id: "{{ path.order_id }}"
+            shipped: true
+            carrier: "{{ body.carrier | default('sf-express') }}"
+        set:
+          carrier: "{{ body.carrier | default('sf-express') }}"
+        next_state: shipped
+
+      - name: ship-too-early
+        priority: 10
+        response:
+          status: 409
+          body:
+            error: not_paid
+            detail: 订单未支付，无法发货
+
+  - id: confirm-receipt
+    path: /orders/{order_id}/confirm
+    methods: [POST]
+    rules:
+      - name: confirm-shipped
+        priority: 100
+        when:
+          - source: state
+            op: eq
+            value: shipped
+        response:
+          status: 200
+          body:
+            order_id: "{{ path.order_id }}"
+            completed: true
+        next_state: completed
+
+      - name: confirm-invalid-state
+        priority: 10
+        response:
+          status: 409
+          body:
+            error: invalid_state
+            detail: 仅 shipped 状态可确认收货（当前 {{ state }}）
+
+  - id: get-order
+    path: /orders/{order_id}
+    methods: [GET]
+    rules:
+      - name: detail
+        priority: 100
+        when:
+          - source: state
+            op: ne
+            value: init
+        response:
+          status: 200
+          headers:
+            X-Order-State: "{{ state }}"
+          body:
+            order_id: "{{ path.order_id }}"
+            state: "{{ state }}"
+            sku: "{{ context.sku | default('') }}"
+            quantity: "{{ context.quantity | default(0) }}"
+            pay_channel: "{{ context.pay_channel | default('') }}"
+            carrier: "{{ context.carrier | default('') }}"
+
+      - name: not-found
+        priority: 10
+        response:
+          status: 404
+          body:
+            error: order_not_found
+
+  - id: cancel-order
+    path: /orders/{order_id}
+    methods: [DELETE]
+    rules:
+      - name: cancel-before-ship
+        priority: 100
+        when:
+          - source: state
+            op: in
+            value: [created, paid]
+        response:
+          status: 200
+          body:
+            order_id: "{{ path.order_id }}"
+            cancelled: true
+        next_state: cancelled
+
+      - name: cancel-too-late
+        priority: 10
+        response:
+          status: 409
+          body:
+            error: cancel_rejected
+            detail: 当前状态 {{ state }} 不可取消

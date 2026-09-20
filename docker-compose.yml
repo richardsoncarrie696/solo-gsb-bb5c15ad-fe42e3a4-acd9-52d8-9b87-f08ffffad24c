@@ -1,0 +1,28 @@
+services:
+  api-simulator:
+    build: .
+    image: stateful-api-simulator:latest
+    container_name: stateful-api-simulator
+    ports:
+      - "${SIM_PORT:-8080}:8080"
+    environment:
+      # 自动加载挂载目录中的 *.yaml 场景（随镜像自带 order-flow 示例）
+      SIM_SCENARIOS_DIR: /app/scenarios
+      # 多场景共存时，未显式指定场景的会话将使用该默认场景
+      SIM_DEFAULT_SCENARIO: ${SIM_DEFAULT_SCENARIO:-}
+      SIM_BUSY_TIMEOUT_MS: "5000"
+      SIM_DB_RETRIES: "20"
+      SIM_LOG_LEVEL: ${SIM_LOG_LEVEL:-info}
+    volumes:
+      - simulator-data:/data
+      # 需要在不重新构建镜像的情况下增删场景时，可挂载宿主任意目录：
+      # - ./my-scenarios:/app/scenarios
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/__health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  simulator-data:
