@@ -12,9 +12,21 @@ from pydantic import BaseModel, Field, field_validator
 
 from ..db import dumps, get_conn, write_tx
 from ..engine import MAX_PREVIEW_STEPS, SimAbort, preview_chain, preview_session
+from ..rng import SessionRng
 from ..store import store
 
 router = APIRouter(prefix="/__sessions", tags=["sessions"])
+
+
+def _validate_seed_value(value: Any) -> int | str | None:
+    """seed 只接受整数（bool 除外）或非空字符串；null 表示不播种。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("seed 只能是整数或字符串")
+    if isinstance(value, str) and not value.strip():
+        raise ValueError("seed 不能是空字符串")
+    return value
 
 
 class CreateSessionBody(BaseModel):
@@ -22,12 +34,24 @@ class CreateSessionBody(BaseModel):
     scenario: str | None = None
     state: str | None = None
     context: dict = Field(default_factory=dict)
+    seed: Any = Field(
+        default=None,
+        description="可复现随机序列种子（整数或字符串）；传入后从头初始化，"
+                    "同种子/同初始状态/同请求链下 uuid4()、random_str()、"
+                    "randint()、choice() 结果一致；不传则保持非确定性随机行为",
+    )
+
+    @field_validator("seed")
+    @classmethod
+    def _validate_seed(cls, value: Any) -> int | str | None:
+        return _validate_seed_value(value)
 
 
 def _session_row(token: str):
     return get_conn().execute(
         """
         SELECT s.token, s.scenario, s.revision, s.state, s.context,
+               s.rand_seed, s.rand_state, s.rand_draws,
                s.created_at, s.updated_at
         FROM sessions s WHERE s.token = ?
         """,
@@ -42,6 +66,9 @@ def _serialize(row) -> dict:
         "revision": row["revision"],
         "state": row["state"],
         "context": json.loads(row["context"]),
+        # 随机状态 blob 不对外暴露；仅暴露是否播种、种子与已抽样步数
+        "random": SessionRng.from_persisted(
+            row["rand_seed"], row["rand_state"], row["rand_draws"]).describe(),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -78,12 +105,17 @@ async def create_session(body: CreateSessionBody) -> JSONResponse:
     context = dict(body.context)
     context.setdefault("_seq", {})
 
+    # 传入 seed 即从头初始化可复现随机序列（状态在会话行内随事务推进）
+    rng = SessionRng.fresh(body.seed)
+
     with write_tx() as conn:
         try:
             conn.execute(
-                "INSERT INTO sessions(token, scenario, revision, state, context)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (token, scenario_name, revision, state, dumps(context)),
+                "INSERT INTO sessions(token, scenario, revision, state, context,"
+                " rand_seed, rand_state, rand_draws)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (token, scenario_name, revision, state, dumps(context),
+                 rng.seed_blob(), rng.state_blob(), rng.draws),
             )
         except sqlite3.IntegrityError:
             return JSONResponse(status_code=409, content={"error": "session_exists", "token": token})
@@ -128,6 +160,16 @@ async def list_events(token: str, limit: int = 50) -> JSONResponse:
 class ResetBody(BaseModel):
     state: str | None = None
     context: dict | None = None
+    seed: Any = Field(
+        default=None,
+        description="传入则用该种子从头初始化随机序列；显式传 null 清除播种、"
+                    "恢复非确定性随机；字段缺省（不传）时保留会话当前随机序列",
+    )
+
+    @field_validator("seed")
+    @classmethod
+    def _validate_seed(cls, value: Any) -> int | str | None:
+        return _validate_seed_value(value)
 
 
 _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
@@ -279,10 +321,21 @@ async def reset_session(token: str, body: ResetBody) -> JSONResponse:
     context = body.context if body.context is not None else {}
     context.setdefault("_seq", {})
 
+    # seed 语义：字段缺省 -> 保留当前随机序列；显式 null -> 清除播种；
+    # 提供整数/字符串 -> 用该种子从头初始化
+    if "seed" in body.model_fields_set:
+        rng = SessionRng.fresh(body.seed)  # None 即恢复未播种的全局随机行为
+    else:
+        rng = SessionRng.from_persisted(row["rand_seed"], row["rand_state"],
+                                        row["rand_draws"])
+
     with write_tx() as conn:
         conn.execute(
-            "UPDATE sessions SET state = ?, context = ?, updated_at = datetime('now') WHERE token = ?",
-            (state, dumps(context), token),
+            "UPDATE sessions SET state = ?, context = ?, rand_seed = ?,"
+            " rand_state = ?, rand_draws = ?, updated_at = datetime('now')"
+            " WHERE token = ?",
+            (state, dumps(context), rng.seed_blob(), rng.state_blob(),
+             rng.draws, token),
         )
         conn.execute("DELETE FROM events WHERE token = ?", (token,))
     return JSONResponse(_serialize(_session_row(token)))

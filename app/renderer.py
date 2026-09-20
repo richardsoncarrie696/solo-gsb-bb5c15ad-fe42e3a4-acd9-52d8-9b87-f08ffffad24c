@@ -6,11 +6,14 @@ import re
 import string
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from jinja2 import StrictUndefined
 from jinja2.exceptions import UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
+
+if TYPE_CHECKING:
+    from .rng import SessionRng
 
 _EXPR_ONLY_RE = re.compile(r"^\{\{(.+)\}\}$", re.S)
 
@@ -38,14 +41,32 @@ def _choice(values: list[Any]) -> Any:
 
 
 class Renderer:
-    """每个请求一个实例：携带 seq 计数器与完整上下文。"""
+    """每个请求一个实例：携带 seq 计数器、完整上下文与（可选的）会话随机源。
 
-    def __init__(self, context: dict[str, Any], *, trace_calls: bool = False):
+    传入 ``session_rng`` 时，``uuid4()`` / ``random_str()`` / ``randint()`` /
+    ``choice()`` 推进该会话的可复现随机序列并累计抽样步数；不传时使用进程
+    全局随机源，保持旧行为。
+    """
+
+    def __init__(self, context: dict[str, Any], *, trace_calls: bool = False,
+                 session_rng: "SessionRng | None" = None):
         self.context = dict(context)
         self.counters: dict[str, int] = dict(self.context.get("_seq") or {})
         # 预演时记录本次渲染中 seq() 的调用轨迹（计数器仍只存在于本实例内存中）
         self.trace_calls = trace_calls
         self.seq_calls: list[dict[str, Any]] = []
+        self.session_rng = session_rng
+
+        if session_rng is not None:
+            uuid4 = session_rng.uuid4
+            random_str = session_rng.random_str
+            randint = session_rng.randint
+            choice = session_rng.choice
+        else:
+            uuid4 = lambda: str(uuid.uuid4())
+            random_str = _random_str
+            randint = random.randint
+            choice = _choice
 
         self.env = SandboxedEnvironment(
             undefined=StrictUndefined,
@@ -53,11 +74,11 @@ class Renderer:
             keep_trailing_newline=True,
         )
         self.env.globals.update(
-            uuid4=lambda: str(uuid.uuid4()),
+            uuid4=uuid4,
             now=_now,
-            random_str=_random_str,
-            randint=random.randint,
-            choice=_choice,
+            random_str=random_str,
+            randint=randint,
+            choice=choice,
             seq=self._seq,
         )
 

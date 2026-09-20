@@ -142,6 +142,8 @@ routes:
   `request`（`method`/`path`/`route`）。
 - 内置函数：`uuid4()`、`now(fmt)`、`random_str(n, prefix='')`、`randint(a,b)`、
   `choice(list)`、`seq(name, start=1)`（会话内自增计数器，跨请求持久化）。
+  前四个为随机函数：会话带 `seed` 时推进可复现的会话私有序列（见
+  [可复现随机序列](#可复现随机序列seed)），否则使用非确定性的全局随机源。
 - 过滤器：Jinja2 标准过滤器（如 `body.x | default('v')`）。
 - 响应体 `body` 为 dict/list 时按 JSON 返回；为字符串时配合 `Content-Type` 头
   可返回 HTML/纯文本等。
@@ -215,13 +217,64 @@ curl -s "$BASE/__scenarios/order-flow/yaml?revision=1"
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/__sessions` | 显式创建会话：`{"token":"t1","scenario":"order-flow","state":"created","context":{}}`，字段均可省略；绑定**当前 revision** 并在响应中返回 |
-| GET | `/__sessions/{token}` | **会话状态查询**：当前状态、绑定的 `revision`、上下文、可用状态、路由列表（按绑定版本给出） |
+| POST | `/__sessions` | 显式创建会话：`{"token":"t1","scenario":"order-flow","state":"created","context":{},"seed":42}`，字段均可省略；`seed`（整数/字符串）传入后从头初始化**可复现随机序列**；绑定**当前 revision** 并在响应中返回 |
+| GET | `/__sessions/{token}` | **会话状态查询**：当前状态、绑定的 `revision`、上下文、可用状态、路由列表（按绑定版本给出），以及随机序列信息 `random`（`seeded`/`seed`/已抽样步数 `draws`） |
 | GET | `/__sessions/{token}/events?limit=50` | 最近的匹配与状态迁移历史（新→旧，含每次命中时的 `revision`） |
 | POST | `/__sessions/{token}/preview` | **请求预演**：不落库地试运行一次业务请求，返回拟响应与 state/context 差异（按会话绑定的 revision 执行） |
 | POST | `/__sessions/{token}/preview/chain` | **连续请求链预演**：有序请求数组基于同一会话快照依次试跑（最多 50 步），逐步返回命中/拟响应/差异与最终快照，不落库 |
-| POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态并清空事件；不改变会话绑定的 revision |
+| POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态并清空事件；不改变会话绑定的 revision；可带 `seed` 重新播种（见下） |
 | DELETE | `/__sessions/{token}` | 删除会话及其事件 |
+
+### 可复现随机序列（seed）
+
+模板里的 `uuid4()`、`random_str()`、`randint()`、`choice()` 默认使用进程级随机源
+（每次结果不同）。创建会话或 reset 时传入 `seed`（整数或字符串）后，会话会拥有
+**私有的随机序列**：同一种子、同一初始状态、同一条请求链，四个函数的输出逐字节一致；
+随机状态随会话上下文一起在**现有的单个 SQLite 写事务**中推进，会话查询暴露已抽样步数
+（`random.draws`，每调用上述函数一次计 1 步）。
+
+```bash
+BASE=http://localhost:8080
+
+# 用固定种子创建会话
+curl -s -X POST $BASE/__sessions -H 'Content-Type: application/json' \
+  -d '{"token":"s1","scenario":"order-flow","seed":"fixed"}'
+# -> ..., "random": {"seeded": true, "seed": "fixed", "draws": 0}
+
+# 先预演整条下单 -> 支付链（预演只克隆随机状态，不改变真实序列）
+curl -s -X POST $BASE/__sessions/s1/preview/chain \
+  -H 'Content-Type: application/json' -d '{
+    "requests": [
+      {"method":"POST","path":"/orders","body":{"sku":"A-1","quantity":2}},
+      {"method":"POST","path":"/orders/1000/pay","body":{"channel":"alipay"}}
+    ]
+  }'
+# 第 2 步拟响应中的 trace（uuid4 的首个抽样值）：
+#   "trace": "2db1dc2d-8687-468d-9ad0-9210ea02c2b9"
+# 每步还带 random_preview：{"draws_before":0,"draws_after":1,"draws_consumed":1,...}
+
+# 再发真实请求：结果与预演完全一致（预演从未消耗真实序列）
+curl -s -X POST $BASE/orders -H 'sim-session-token: s1' \
+  -H 'Content-Type: application/json' -d '{"sku":"A-1","quantity":2}'
+curl -s -X POST $BASE/orders/1000/pay -H 'sim-session-token: s1' \
+  -H 'Content-Type: application/json' -d '{"channel":"alipay"}'
+# -> "trace": "2db1dc2d-8687-468d-9ad0-9210ea02c2b9"   ← 与预演相同
+
+curl -s $BASE/__sessions/s1
+# -> ..., "random": {"seeded": true, "seed": "fixed", "draws": 1}
+```
+
+关键语义：
+
+- **真实失败不消耗序列**：404 无路由 / 405 方法不支持 / 409 无命中规则 / 500 渲染失败
+  都会回滚事务（或在渲染前中止），随机步数保持不变；之后的成功请求仍从失败前的状态抽样。
+- **预演克隆随机状态**：单次预演与请求链预演都从持久化快照克隆一份随机状态使用，
+  链内后一步看得到前一步的消耗（每步 `random_preview` 给出 `draws_before/after`，
+  链路 `final_snapshot.random` 给出拟最终步数），但预演结束真实序列不变，可重复预演。
+- **reset 的 seed 三态**：请求体带 `"seed": <int|str>` → 用该种子从头初始化；
+  显式 `"seed": null` → 清除播种、恢复非确定性随机；**不带 seed 字段** → 保留当前随机序列。
+- **不传 seed 完全兼容**：四个函数继续走全局随机源，既有调用方式与响应结构不变
+  （`random.draws` 对所有会话都会统计）。
 
 #### 请求预演（dry-run）
 
@@ -231,6 +284,9 @@ curl -s "$BASE/__scenarios/order-flow/yaml?revision=1"
 - 全程在只读事务中执行并最终回滚：**不写 sessions、不写 events**；
 - 即使模板调用了 `seq()`，计数也只在预演渲染器内存中自增——随后的真实请求
   仍从**预演前的计数值**开始（可多次预演，结果幂等）；
+- 随机函数（`uuid4()`/`random_str()`/`randint()`/`choice()`）同样只推进
+  **克隆的随机状态**：预演不消耗真实序列；会话有 `seed` 时预演结果与真实请求
+  完全一致，步数变化见响应中的 `random_preview`（`draws_before`/`draws_after`）；
 - 命中时 HTTP 状态码为 `200`，拟返回的状态码在 `response.status_code` 中；
   未命中时直接返回**与真实请求一致的状态码与错误详情**（404 / 405 / 409 /
   500 等），并附带逐条件判定轨迹 `trace`；
@@ -274,6 +330,11 @@ curl -s -X POST $BASE/__sessions/t1/preview \
   },
   "state_diff": {"before": "created", "after": "paid", "changed": true},
   "context_diff": {"added": {"pay_channel": "alipay"}, "changed": {}, "removed": []},
+  "random_preview": {
+    "seeded": true, "seed": "fixed",
+    "draws_before": 0, "draws_after": 1, "draws_consumed": 1,
+    "note": "仅预演内推进（克隆的随机状态），不会持久化；随后真实请求仍从预演前的状态开始"
+  },
   "seq_preview": [
     {"name": "order", "start": 1000, "value": 1000, "existed": false,
      "before": null,
@@ -322,8 +383,11 @@ curl -s -X POST $BASE/__sessions/t1/preview \
   失败请求与错误体（含 `trace`），以及此前已成功的各步；
 - 全程在只读事务中执行并最终回滚：**不写 sessions、不写 events、不推进序列
   计数**；`seq()` 只在预演内存中沿链路自增（后一步看得到、库中不保留），
-  会话快照不变时**多次调用结果可重复**（模板内的 `now()`/`uuid4()` 与单次
-  预演一样是运行时值）；
+  随机函数同样沿**同一份克隆随机状态**推进（每步 `random_preview` 可见
+  `draws_before/after`，`final_snapshot.random` 给出拟最终步数，库中不保留）；
+  会话快照不变时**多次调用结果可重复**——会话有 `seed` 时连 `uuid4()`/
+  `random_str()`/`randint()`/`choice()` 也完全相同（未播种会话的 `now()`/
+  `uuid4()` 与单次预演一样是运行时值）；
 - 同样要求会话**已存在**，不存在返回 404。
 
 ```bash
@@ -379,6 +443,7 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
     "context": {"sku": "A-1", "quantity": 2, "pay_channel": "alipay",
                 "carrier": "sf"},
     "seq": {"order": 1001},
+    "random": {"seeded": true, "seed": "fixed", "draws": 1},
     "note": "链路预演的拟最终快照，不会持久化；随后真实请求仍从预演前的快照开始"
   }
 }
@@ -402,7 +467,8 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
     "error": {"error": "no_route", "path": "/ghost/9", "trace": [ "..."]}
   },
   "steps": [ {"index": 0, "...": "失败前的成功步骤..."} ],
-  "final_snapshot": {"state": "created", "context": {"...": "..."}, "seq": {}}
+  "final_snapshot": {"state": "created", "context": {"...": "..."}, "seq": {},
+                     "random": {"seeded": true, "seed": "fixed", "draws": 0}}
 }
 ```
 
@@ -424,10 +490,10 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
 所有会读写会话的业务请求都在同一个 `BEGIN IMMEDIATE` 事务中执行：
 
 1. 立即获取 SQLite 写锁（同库同刻只有一个写事务）；
-2. 读取会话行（`state`/`context`）；
+2. 读取会话行（`state`/`context`/随机状态）；
 3. 匹配路由与最高优先级规则；
-4. 渲染响应、计算 `set` 与 `next_state`；
-5. 更新会话并写入一条 `events` 记录，然后提交。
+4. 渲染响应、计算 `set` 与 `next_state`，渲染中的随机抽样推进会话随机序列；
+5. 更新会话（状态、上下文、随机状态）并写入一条 `events` 记录，然后提交。
 
 拿不到锁时按 `SIM_BUSY_TIMEOUT_MS` 等待并在应用层重试（`SIM_DB_RETRIES` 次）。
 因此同一会话的并发请求会被**串行化**，每个请求看到的都是前一个请求提交后的新状态：
@@ -474,6 +540,7 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 │   ├── models.py          # 场景/路由/规则数据模型
 │   ├── matching.py        # 路径模式、点路径取值、条件运算符
 │   ├── renderer.py        # Jinja2 沙箱渲染与模板函数
+│   ├── rng.py             # 会话级可复现随机序列（种子/状态克隆/抽样步数）
 │   ├── engine.py          # 核心：单事务匹配→渲染→迁移；同快照只读单请求/请求链预演（零副作用）
 │   ├── store.py           # 已编译场景缓存（按 name+revision）、发布/激活
 │   └── routers/
@@ -489,9 +556,10 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 
 数据库表：`scenarios`（场景名 → 当前 revision）、`scenario_revisions`（不可变的
 场景定义版本，`(scenario, revision)` 主键）、`sessions`（令牌 → 场景/绑定
-revision/状态/上下文）、`events`（每次命中的 revision、路由、规则、前后状态与
-状态码）。启动时自动检测并就地升级旧版表结构：旧定义固化为 revision 1，
-既有会话回填绑定该版本，历史事件的 revision 置空。
+revision/状态/上下文/可复现随机序列 `rand_seed`、`rand_state`、`rand_draws`）、
+`events`（每次命中的 revision、路由、规则、前后状态与状态码）。启动时自动检测并
+就地升级旧版表结构：旧定义固化为 revision 1，既有会话回填绑定该版本，历史事件的
+revision 置空；旧会话补齐随机序列三列并保持不播种（随机行为与旧版本一致）。
 
 ---
 

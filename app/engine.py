@@ -5,7 +5,11 @@
 state/context 差异；请求链预演（``preview_chain``）从同一快照出发依次执行
 有序请求，后一步看到前一步拟产生的 state/context/seq 变化，任一匹配或渲染
 失败即停止。两种预演全程回滚、不写任何表；即使模板调用 ``seq()``，计数器
-也只在一次性的渲染器实例内自增，随后的真实请求仍看到预演前的值。
+也只在一次性的渲染器实例内自增，随后的真实请求仍看到预演前的值。随机函数
+（``uuid4``/``random_str``/``randint``/``choice``）同理：预演从持久化的会话
+随机状态**克隆**一份使用——链内共享该克隆（后一步看得到前一步的抽样），
+预演结束真实序列不变。真实请求的随机状态则在写事务中随会话行一并提交，
+失败（无路由/无规则/渲染异常）回滚，不消耗序列。
 """
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ from .db import dumps, read_tx, write_tx
 from .matching import evaluate_condition, get_condition_value, match_path
 from .models import Route, Rule, Scenario
 from .renderer import RenderError, Renderer
+from .rng import SessionRng
 from .store import store
 
 
@@ -234,6 +239,8 @@ class _Planned:
     new_context: dict[str, Any]
     counters: dict[str, int]
     seq_calls: list[dict[str, Any]]
+    draws_before: int
+    draws_after: int
     trace: list[dict[str, Any]]
 
 
@@ -241,7 +248,7 @@ def _plan_matched(scenario: Scenario, scenario_name: str, route: Route,
                   path_params: dict[str, str], rule: Rule, *, state: str,
                   context: dict[str, Any], method: str, path: str,
                   body: Any, query: dict[str, Any], headers: dict[str, Any],
-                  trace: list[dict[str, Any]]) -> _Planned:
+                  rng: SessionRng, trace: list[dict[str, Any]]) -> _Planned:
     render_ctx = dict(context)
     render_ctx.update({
         "state": state,
@@ -252,8 +259,11 @@ def _plan_matched(scenario: Scenario, scenario_name: str, route: Route,
         "request": {"method": method, "path": path, "route": route.id},
         "context": dict(context),
     })
-    # 预演（preview=True）时记录 seq() 调用；计数器在任何情况下都只存于本实例
-    renderer = Renderer(render_ctx, trace_calls=True)
+    # 预演（preview=True）时记录 seq() 调用；计数器在任何情况下都只存于本实例。
+    # 随机函数（uuid4/random_str/randint/choice）统一推进会话级 rng：
+    # 真实请求提交时随事务持久化，预演时 rng 是快照克隆，不会影响真实序列。
+    draws_before = rng.draws
+    renderer = Renderer(render_ctx, trace_calls=True, session_rng=rng)
 
     try:
         status, resp_headers, resp_body, is_json = _render_response(rule, renderer)
@@ -294,20 +304,35 @@ def _plan_matched(scenario: Scenario, scenario_name: str, route: Route,
         new_context=new_context,
         counters=dict(renderer.counters),
         seq_calls=list(renderer.seq_calls),
+        draws_before=draws_before,
+        draws_after=rng.draws,
         trace=trace,
     )
 
 
+@dataclass
+class _Snapshot:
+    """一次请求所基于的会话快照（含会话级随机序列持有方）。"""
+    scenario: Scenario
+    scenario_name: str
+    revision: int
+    state: str
+    context: dict[str, Any]
+    rng: SessionRng
+    is_new: bool
+
+
 def _resolve_snapshot(conn, token: str, explicit_scenario: str | None,
-                      default_scenario: str | None) -> tuple[
-                          Scenario, str, int, str, dict[str, Any], bool]:
+                      default_scenario: str | None) -> _Snapshot:
     """解析会话快照；不存在时按真实请求的规则懒创建（仅真实写路径会落库）。
 
     既有会话始终返回其创建时绑定的 revision；场景之后再次发布或激活
     其他版本都不影响该会话。新会话则绑定此刻的当前 revision。
+    随机序列同样从行内恢复；懒创建的新会话没有 seed，使用全局随机源。
     """
     row = conn.execute(
-        "SELECT scenario, revision, state, context FROM sessions WHERE token = ?",
+        "SELECT scenario, revision, state, context, rand_seed, rand_state, rand_draws"
+        " FROM sessions WHERE token = ?",
         (token,),
     ).fetchone()
 
@@ -319,10 +344,27 @@ def _resolve_snapshot(conn, token: str, explicit_scenario: str | None,
         scenario = store.get(scenario_name, revision)
         if scenario is None:
             raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
-        return scenario, scenario_name, revision, row["state"], json.loads(row["context"]), False
+        return _Snapshot(
+            scenario=scenario,
+            scenario_name=scenario_name,
+            revision=revision,
+            state=row["state"],
+            context=json.loads(row["context"]),
+            rng=SessionRng.from_persisted(row["rand_seed"], row["rand_state"],
+                                          row["rand_draws"]),
+            is_new=False,
+        )
 
     scenario, revision = _select_scenario(explicit_scenario, default_scenario)
-    return scenario, scenario.name, revision, scenario.initial_state, {}, True
+    return _Snapshot(
+        scenario=scenario,
+        scenario_name=scenario.name,
+        revision=revision,
+        state=scenario.initial_state,
+        context={},
+        rng=SessionRng.fresh(None),
+        is_new=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -353,19 +395,22 @@ async def simulate(request, default_scenario: str | None = None) -> SimResult:
 def _run_locked(conn, token, method, path, query, headers, body,
                 default_scenario, explicit_scenario) -> SimResult:
     # 1) 查找会话与场景（不存在则按懒创建规则选场景，暂不落库）
-    scenario, scenario_name, revision, state, context, is_new_session = _resolve_snapshot(
-        conn, token, explicit_scenario, default_scenario)
+    snap = _resolve_snapshot(conn, token, explicit_scenario, default_scenario)
+    scenario, scenario_name, revision = snap.scenario, snap.scenario_name, snap.revision
+    state, context, rng = snap.state, snap.context, snap.rng
 
-    # 2) 匹配路由（不存在则回滚，不留下空会话）
+    # 2) 匹配路由（不存在则回滚，不留下空会话，随机序列也不消耗）
     route, path_params, _trace = _match_routes(scenario, method, path)
 
     # 3) 新会话落库：绑定此刻的当前 revision，之后不再随发布变化
-    if is_new_session:
+    if snap.is_new:
         try:
             conn.execute(
-                "INSERT INTO sessions(token, scenario, revision, state, context)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (token, scenario_name, revision, state, dumps(context)),
+                "INSERT INTO sessions(token, scenario, revision, state, context,"
+                " rand_seed, rand_state, rand_draws)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (token, scenario_name, revision, state, dumps(context),
+                 rng.seed_blob(), rng.state_blob(), rng.draws),
             )
         except sqlite3.IntegrityError:
             # 并发首请求：另一事务已插入，转为锁冲突重试
@@ -378,6 +423,7 @@ def _run_locked(conn, token, method, path, query, headers, body,
     trace = _trace + rule_trace
 
     if rule is None:
+        # 渲染尚未发生，随机状态未被触碰；commit 仅落新会话行，序列步数不变
         raise SimAbort(409, {
             "error": "no_matching_rule",
             "scenario": scenario_name,
@@ -386,14 +432,17 @@ def _run_locked(conn, token, method, path, query, headers, body,
             "state": state,
         }, commit_on_abort=True, trace=trace)
 
-    # 5) 渲染响应 + 推进状态（同一事务内）
+    # 5) 渲染响应 + 推进状态与随机序列（同一事务内；渲染异常整体回滚不消耗）
     planned = _plan_matched(scenario, scenario_name, route, path_params, rule,
                             state=state, context=context, method=method, path=path,
-                            body=body, query=query, headers=headers, trace=trace)
+                            body=body, query=query, headers=headers,
+                            rng=rng, trace=trace)
 
     conn.execute(
-        "UPDATE sessions SET state = ?, context = ?, updated_at = datetime('now') WHERE token = ?",
-        (planned.next_state, dumps(planned.new_context), token),
+        "UPDATE sessions SET state = ?, context = ?, rand_state = ?, rand_draws = ?,"
+        " updated_at = datetime('now') WHERE token = ?",
+        (planned.next_state, dumps(planned.new_context),
+         rng.state_blob(), rng.draws, token),
     )
     conn.execute(
         """
@@ -465,15 +514,29 @@ def _build_seq_preview(context: dict[str, Any], counters: dict[str, int],
     ]
 
 
+def _build_random_preview(planned: _Planned, rng: SessionRng) -> dict[str, Any]:
+    """本步渲染对随机序列的抽样情况（步数前后与种子）。"""
+    return {
+        "seeded": rng.seeded,
+        "seed": rng.seed,
+        "draws_before": planned.draws_before,
+        "draws_after": planned.draws_after,
+        "draws_consumed": planned.draws_after - planned.draws_before,
+        "note": "仅预演内推进（克隆的随机状态），不会持久化；随后真实请求仍从预演前的状态开始",
+    }
+
+
 def _simulate_step(scenario: Scenario, scenario_name: str, revision: int, *, state: str,
                    context: dict[str, Any], method: str, path: str,
                    query: dict[str, Any], headers: dict[str, Any],
-                   body: Any) -> tuple[dict[str, Any], str, dict[str, Any]]:
+                   body: Any, rng: SessionRng) -> tuple[
+                       dict[str, Any], str, dict[str, Any], SessionRng]:
     """在内存快照上执行一次匹配/渲染（真实与预演共用的同一套语义）。
 
     纯函数：不触碰数据库。返回 (本步结构化结果, 拟产生的下一状态,
-    拟产生的下一上下文（含 _seq 计数器）)。路由不匹配、无命中规则或
-    渲染失败时抛出 :class:`SimAbort`（与真实引擎的状态码/错误体一致）。
+    拟产生的下一上下文（含 _seq 计数器）, 被推进后的随机序列持有方)。
+    路由不匹配、无命中规则或渲染失败时抛出 :class:`SimAbort`（与真实引擎
+    的状态码/错误体一致）；此时 ``rng`` 未被渲染推进（与真实失败不消耗一致）。
     """
     route, path_params, trace = _match_routes(scenario, method, path)
 
@@ -494,7 +557,8 @@ def _simulate_step(scenario: Scenario, scenario_name: str, revision: int, *, sta
 
     planned = _plan_matched(scenario, scenario_name, route, path_params, rule,
                             state=state, context=context, method=method, path=path,
-                            body=body, query=query, headers=headers, trace=trace)
+                            body=body, query=query, headers=headers,
+                            rng=rng, trace=trace)
 
     step = {
         "matched": {
@@ -522,9 +586,10 @@ def _simulate_step(scenario: Scenario, scenario_name: str, revision: int, *, sta
         "context_diff": _build_diff(planned.context, planned.new_context),
         "seq_preview": _build_seq_preview(planned.context, planned.counters,
                                           planned.seq_calls),
+        "random_preview": _build_random_preview(planned, rng),
         "trace": planned.trace,
     }
-    return step, planned.next_state, planned.new_context
+    return step, planned.next_state, planned.new_context, rng
 
 
 def _failure_kind(status_code: int) -> str:
@@ -546,7 +611,8 @@ def preview_session(token: str, method: str, path: str, query: dict[str, Any],
     """
     with read_tx() as conn:
         row = conn.execute(
-            "SELECT scenario, revision, state, context FROM sessions WHERE token = ?",
+            "SELECT scenario, revision, state, context, rand_seed, rand_state, rand_draws"
+            " FROM sessions WHERE token = ?",
             (token,),
         ).fetchone()
         if row is None:
@@ -564,10 +630,15 @@ def preview_session(token: str, method: str, path: str, query: dict[str, Any],
             raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
         state = row["state"]
         context = json.loads(row["context"])
+        # 克隆会话随机状态：预演内的抽样不影响真实序列（含未播种会话——
+        # 克隆一份全局状态，预演连进程全局随机源也不扰动）
+        rng = SessionRng.from_persisted(
+            row["rand_seed"], row["rand_state"], row["rand_draws"]).clone()
 
-        step, _next_state, _next_context = _simulate_step(
+        step, _next_state, _next_context, _rng = _simulate_step(
             scenario, scenario_name, revision, state=state, context=context,
-            method=method, path=path, query=query, headers=headers, body=body)
+            method=method, path=path, query=query, headers=headers, body=body,
+            rng=rng)
 
     # 事务已回滚：以下全部是基于快照的拟结果
     payload = {"preview": {"persisted": False}, "token": token,
@@ -588,7 +659,8 @@ def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict
     """
     with read_tx() as conn:
         row = conn.execute(
-            "SELECT scenario, revision, state, context FROM sessions WHERE token = ?",
+            "SELECT scenario, revision, state, context, rand_seed, rand_state, rand_draws"
+            " FROM sessions WHERE token = ?",
             (token,),
         ).fetchone()
         if row is None:
@@ -607,6 +679,10 @@ def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict
             raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
         initial_state = row["state"]
         initial_context = json.loads(row["context"])
+        # 整链共享同一个克隆随机状态：链内后一步看得到前一步的抽样消耗，
+        # 但预演结束（事务回滚）后真实序列不变
+        rng = SessionRng.from_persisted(
+            row["rand_seed"], row["rand_state"], row["rand_draws"]).clone()
 
         state = initial_state
         context = initial_context
@@ -616,10 +692,11 @@ def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict
 
         for index, req in enumerate(requests):
             try:
-                step, next_state, next_context = _simulate_step(
+                step, next_state, next_context, rng = _simulate_step(
                     scenario, scenario_name, revision, state=state, context=context,
                     method=req["method"], path=req["path"],
-                    query=req["query"], headers=req["headers"], body=req["body"])
+                    query=req["query"], headers=req["headers"], body=req["body"],
+                    rng=rng)
             except SimAbort as exc:
                 # 路由、规则或渲染失败：立即停止，仅返回此前成功步骤
                 failed_index = index
@@ -650,6 +727,11 @@ def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict
             "state": state,
             "context": {k: v for k, v in context.items() if k != "_seq"},
             "seq": seq_counters,
+            "random": {
+                "seeded": rng.seeded,
+                "seed": rng.seed,
+                "draws": rng.draws,
+            },
             "note": "链路预演的拟最终快照，不会持久化；随后真实请求仍从预演前的快照开始",
         }
 

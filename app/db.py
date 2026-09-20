@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     revision         INTEGER,
     state            TEXT NOT NULL,
     context          TEXT NOT NULL,
+    rand_seed        TEXT,
+    rand_state       TEXT,
+    rand_draws       INTEGER NOT NULL DEFAULT 0,
     created_at       TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (scenario) REFERENCES scenarios(name)
@@ -110,7 +113,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     - scenarios 增加 current_revision；旧定义原样固化为 revision 1 并置为当前版本；
     - sessions 增加 revision，既有会话回填为其场景当时的当前版本（迁移后均为 1）；
-    - events 增加 revision（历史事件无法回溯版本，保留 NULL）。
+    - events 增加 revision（历史事件无法回溯版本，保留 NULL）；
+    - sessions 增加 rand_seed/rand_state/rand_draws（可复现随机序列，旧会话不播种）。
     """
     scenario_cols = _column_names(conn, "scenarios")
     if "current_revision" not in scenario_cols:
@@ -139,6 +143,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     if "revision" not in _column_names(conn, "events"):
         conn.execute("ALTER TABLE events ADD COLUMN revision INTEGER")
+
+    _migrate_session_rng(conn)
+
+
+def _migrate_session_rng(conn: sqlite3.Connection) -> None:
+    """会话可复现随机序列的三列就地升级（旧会话保持未播种的全局随机行为）。"""
+    session_cols = _column_names(conn, "sessions")
+    if "rand_seed" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN rand_seed TEXT")
+    if "rand_state" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN rand_state TEXT")
+    if "rand_draws" not in session_cols:
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN rand_draws INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 class WriteLocked(sqlite3.OperationalError):
